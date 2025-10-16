@@ -1,0 +1,125 @@
+#!/bin/bash
+set -euo pipefail
+
+VG_NAME="datavg"
+OM_LVS=("lv_ozone_metadata" "lv_ozone_ratis" "lv_ozone_data" "lv_ozone_snapshot")
+OM_MOUNT_POINTS=(
+  "/var/app/lib/hadoop-ozone/om/ozone-metadata"
+  "/var/app/lib/hadoop-ozone/om/ratis"
+  "/var/app/lib/hadoop-ozone/om/data"
+  "/data/1/om/snapshot"
+)
+
+# Use whole disks, not partitions:
+PARTITIONS=(/dev/sdb /dev/sdc /dev/sdd /dev/sde)
+
+echo "==> Ozone OM Node Filesystem Setup Script Started..."
+
+# Step 1: Unmount & Wipe any old signatures
+for part in "${PARTITIONS[@]}"; do
+  # skip if device not present
+  if [[ ! -b "$part" ]]; then
+    echo "--> Skipping $part (no such block device)"
+    continue
+  fi
+
+  # Try to unmount anything using this device (or its children)
+  mountpoints=$(lsblk -nr -o MOUNTPOINT "$part" 2>/dev/null | awk 'NF')
+  if [[ -n "$mountpoints" ]]; then
+    while read -r mp; do
+      echo "--> Unmounting $mp ..."
+      umount -fl "$mp" || { echo "Failed to unmount $mp"; exit 1; }
+    done <<< "$mountpoints"
+  fi
+
+  echo "--> Wiping $part ..."
+  # Clean partition table & FS signatures
+  wipefs -a "$part" || { echo "Failed to wipe $part"; exit 1; }
+  # Ensure kernel re-reads partition table (even though using whole disk)
+  partprobe "$part" || true
+done
+
+# Step 2: Create/extend Volume Group
+if ! vgs "$VG_NAME" &>/dev/null; then
+  echo "--> Creating VG $VG_NAME"
+  # Use only present block devices
+  disks_present=()
+  for d in "${PARTITIONS[@]}"; do [[ -b "$d" ]] && disks_present+=("$d"); done
+  [[ ${#disks_present[@]} -gt 0 ]] || { echo "No candidate disks found"; exit 1; }
+
+  for disk in "${disks_present[@]}"; do
+    pvcreate -ff -y "$disk" || { echo "pvcreate failed on $disk"; exit 1; }
+  done
+  vgcreate "$VG_NAME" "${disks_present[@]}" || { echo "vgcreate failed"; exit 1; }
+else
+  echo "--> VG $VG_NAME already exists; ensuring PVs added"
+  for disk in "${PARTITIONS[@]}"; do
+    [[ -b "$disk" ]] || continue
+    if ! pvs --noheadings -o pv_name | grep -q -w "$disk"; then
+      pvcreate -ff -y "$disk"
+      vgextend "$VG_NAME" "$disk"
+    fi
+  done
+fi
+
+# Step 3: Create Logical Volumes if missing
+for lv in "${OM_LVS[@]}"; do
+  if ! lvs "/dev/${VG_NAME}/${lv}" &>/dev/null; then
+    echo "--> Creating LV: $lv"
+    # adjust size policy as you like; here we allocate reasonably:
+    # metadata 20G, ratis 50G, data 200G, snapshot 20G if space allows.
+    case "$lv" in
+      lv_ozone_metadata) size="20G" ;;
+      lv_ozone_ratis)    size="50G" ;;
+      lv_ozone_data)     size="200G" ;;
+      lv_ozone_snapshot) size="20G" ;;
+      *) size="10G" ;;
+    esac
+    lvcreate -n "$lv" -L "$size" "$VG_NAME" || { echo "lvcreate failed for $lv"; exit 1; }
+  else
+    echo "-> LV $lv already exists, skipping create."
+  fi
+done
+
+# Step 4: Format as ext4 if not already
+for lv in "${OM_LVS[@]}"; do
+  device="/dev/${VG_NAME}/${lv}"
+  if blkid "$device" | grep -q 'TYPE="ext4"'; then
+    echo "-> $device already formatted"
+  else
+    echo "--> Formatting $device"
+    mkfs.ext4 -F "$device"
+  fi
+done
+
+# Step 5: Create mount directories
+for mp in "${OM_MOUNT_POINTS[@]}"; do
+  mkdir -p "$mp"
+done
+
+# Step 6: Update /etc/fstab using UUIDs
+echo "==> Updating /etc/fstab"
+# Remove old entries for this VG
+sed -i.bak -E "/\/dev\/${VG_NAME}\//d" /etc/fstab
+
+{
+  echo "# Ozone OM mounts (managed)"
+  echo "$(blkid -o export /dev/${VG_NAME}/lv_ozone_metadata | grep ^UUID=)/var/app/lib/hadoop-ozone/om/ozone-metadata ext4 defaults 0 2" \
+    | sed 's/^UUID=/UUID=/'
+  echo "$(blkid -o export /dev/${VG_NAME}/lv_ozone_ratis | grep ^UUID=)/var/app/lib/hadoop-ozone/om/ratis ext4 defaults 0 2" \
+    | sed 's/^UUID=/UUID=/'
+  echo "$(blkid -o export /dev/${VG_NAME}/lv_ozone_data | grep ^UUID=)/var/app/lib/hadoop-ozone/om/data ext4 defaults 0 2" \
+    | sed 's/^UUID=/UUID=/'
+  echo "$(blkid -o export /dev/${VG_NAME}/lv_ozone_snapshot | grep ^UUID=)/data/1/om/snapshot ext4 defaults 0 2" \
+    | sed 's/^UUID=/UUID=/'
+} | awk -FUUID= '{ if (NF>1) print "UUID="$2 }' >> /etc/fstab
+
+# Step 7: Mount all
+echo "==> Mounting all filesystems..."
+mount -a
+
+# Step 8: Verify
+echo "==> Verifying mount layout..."
+df -h | egrep -E "$VG_NAME|/data/1/om|/var/app"
+
+echo "✅ OM node disk setup complete."
