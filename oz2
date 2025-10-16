@@ -1,0 +1,7 @@
+VG: datavg
+DISKS: []           # optional; if empty we auto-discover PV disks for {{ VG }}
+WIPE_GPT: true      # set false to skip sgdisk zap-all
+WIPE_ZERO_HEAD: true
+WIPE_ZERO_TAIL: true
+ZERO_HEAD_MB: 10
+ZERO_TAIL_MB: 10
