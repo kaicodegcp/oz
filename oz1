@@ -1,0 +1,169 @@
+---
+- name: guard - must be root
+  ansible.builtin.assert:
+    that: ansible_user_id == "root"
+    quiet: true
+
+- name: guard - refuse rootvg
+  ansible.builtin.assert:
+    that: VG != "rootvg"
+    quiet: true
+
+- name: df before
+  ansible.builtin.command: df -h
+  register: df_before
+  changed_when: false
+- name: discover mapped LV devices for VG
+  ansible.builtin.command: >
+    bash -lc "lvs --noheadings -o lv_path,vg_name | awk '$2==\"{{ VG }}\"{print $1}'"
+  register: lv_paths
+  changed_when: false
+  failed_when: false
+
+- name: normalize LV list
+  ansible.builtin.set_fact:
+    lv_list: "{{ (lv_paths.stdout_lines | default([])) | map('trim') | select('match','^/dev/') | list }}"
+
+- name: discover mountpoints from /proc/mounts for this VG
+  ansible.builtin.shell: |
+    awk '$1 ~ "/mapper/{{ VG }}-" {print $2}' /proc/mounts | sort -r
+  args:
+    executable: /bin/bash
+  register: vg_mounts
+  changed_when: false
+  failed_when: false
+
+- name: backup fstab
+  ansible.builtin.copy:
+    src: /etc/fstab
+    dest: "/etc/fstab.{{ lookup('pipe','date +%Y%m%d%H%M%S') }}.bak"
+    remote_src: true
+  changed_when: true
+  failed_when: false
+
+- name: unmount all mounts from this VG (force)
+  ansible.builtin.shell: |
+    set -e
+    for mnt in {{ (vg_mounts.stdout_lines | default([])) | map('quote') | join(' ') }}; do
+      umount -fl "$mnt" >/dev/null 2>&1 || true
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+
+- name: remove fstab entries for this VG
+  ansible.builtin.shell: |
+    sed -i -e '\|/dev/mapper/{{ VG }}-|d' -e '\|/dev/{{ VG }}/|d' /etc/fstab
+  args:
+    executable: /bin/bash
+  changed_when: true
+  failed_when: false
+
+- name: detect swap devices in VG
+  ansible.builtin.shell: |
+    awk '$1 ~ "/mapper/{{ VG }}-" && $3=="swap"{print $1}' /proc/swaps
+  args: {executable: /bin/bash}
+  register: vg_swaps
+  changed_when: false
+  failed_when: false
+
+- name: swapoff LVs in VG
+  ansible.builtin.shell: |
+    for dev in {{ (vg_swaps.stdout_lines | default([])) | map('quote') | join(' ') }}; do
+      swapoff "$dev" >/dev/null 2>&1 || true
+    done
+  args: {executable: /bin/bash}
+  when: (vg_swaps.stdout | default('')) != ""
+  changed_when: true
+  failed_when: false
+
+- name: lvremove discovered LVs (ignore errors)
+  ansible.builtin.shell: lvremove -fy "{{ item }}" >/dev/null 2>&1 || true
+  args: {executable: /bin/bash}
+  loop: "{{ lv_list | default([]) }}"
+  changed_when: true
+  failed_when: false
+
+- name: catch-all remove any remaining LVs in VG
+  ansible.builtin.shell: |
+    for p in $(lvs --noheadings -o lv_path,vg_name 2>/dev/null | awk '$2=="{{ VG }}"{print $1}'); do
+      lvremove -fy "$p" >/dev/null 2>&1 || true
+    done
+  args: {executable: /bin/bash}
+  changed_when: true
+  failed_when: false
+
+- name: deactivate and remove VG (ignore if gone)
+  ansible.builtin.shell: |
+    vgchange -an "{{ VG }}" >/dev/null 2>&1 || true
+    vgremove -fy "{{ VG }}" >/dev/null 2>&1 || true
+  args: {executable: /bin/bash}
+  changed_when: true
+  failed_when: false
+
+- name: find PV devices that belonged to VG
+  ansible.builtin.shell: |
+    pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk '$2=="{{ VG }}"{print $1}'
+  args: {executable: /bin/bash}
+  register: pv_auto
+  changed_when: false
+  failed_when: false
+
+- name: compute target disks (exclude anything from rootvg)
+  ansible.builtin.shell: |
+    comm -23 <(printf "%s\n" {{ ((DISKS | length > 0) | ternary(DISKS, pv_auto.stdout_lines | default([]))) | map('quote') | join(' ') }} | sort -u) \
+             <(pvs --noheadings -o pv_name,vg_name 2>/dev/null | awk '$2=="rootvg"{print $1}' | sort -u)
+  args: {executable: /bin/bash}
+  register: disks_final
+  changed_when: false
+  failed_when: false
+
+- name: pvremove on member PVs
+  ansible.builtin.shell: pvremove -ff -y "{{ item }}" >/dev/null 2>&1 || true
+  args: {executable: /bin/bash}
+  loop: "{{ disks_final.stdout_lines | default([]) }}"
+  changed_when: true
+  failed_when: false
+
+- name: wipe signatures on raw disks
+  ansible.builtin.shell: |
+    for d in {{ (disks_final.stdout_lines | default([])) | map('quote') | join(' ') }}; do
+      [ -b "$d" ] || continue
+      wipefs -a "$d" >/dev/null 2>&1 || true
+      if {{ WIPE_GPT | ternary('true','false') }} && command -v sgdisk >/dev/null 2>&1; then
+        sgdisk --zap-all "$d" >/dev/null 2>&1 || true
+      fi
+      if {{ WIPE_ZERO_HEAD | ternary('true','false') }}; then
+        dd if=/dev/zero of="$d" bs=1M count={{ ZERO_HEAD_MB }} status=none || true
+      fi
+      if {{ WIPE_ZERO_TAIL | ternary('true','false') }}; then
+        # best effort: try to get size and zero last blocks
+        sz=$(blockdev --getsz "$d" 2>/dev/null || echo 0)
+        if [ "$sz" -gt 0 ]; then
+          dd if=/dev/zero of="$d" bs=512 seek=$((sz-{{ ZERO_TAIL_MB }}*2048)) count=$(({{ ZERO_TAIL_MB }}*2048)) status=none || true
+        fi
+      fi
+      partprobe "$d" >/dev/null 2>&1 || true
+    done
+  args: {executable: /bin/bash}
+  changed_when: true
+  failed_when: false
+
+- name: remove stale dm maps for VG
+  ansible.builtin.shell: |
+    dmsetup ls 2>/dev/null | awk '/{{ VG }}-/{print $1}' | while read n; do dmsetup remove "$n" >/dev/null 2>&1 || true; done
+  args: {executable: /bin/bash}
+  changed_when: true
+  failed_when: false
+
+- name: df after
+  ansible.builtin.command: df -h
+  register: df_after
+  changed_when: false
+
+- name: show before/after
+  ansible.builtin.debug:
+    msg:
+      - "df (before): {{ df_before.stdout }}"
+      - "df (after):  {{ df_after.stdout }}"
