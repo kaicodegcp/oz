@@ -1,0 +1,38 @@
+disk=/dev/sdb
+
+# 1) Unmount anything on the disk (children too)
+umount -fl $(lsblk -rno MOUNTPOINT "$disk" 2>/dev/null | awk 'NF') 2>/dev/null || true
+umount -fl $(lsblk -rno MOUNTPOINT "${disk}"?* 2>/dev/null | awk 'NF') 2>/dev/null || true
+
+# 2) If it’s in LVM, deactivate and remove only what sits on this PV
+for lv in $(lvs --noheadings -o lv_path,devices 2>/dev/null | awk '$2 ~ /sdb/ {print $1}'); do
+  lvchange -an "$lv" || true
+done
+for vg in $(pvs --noheadings -o vg_name,pv_name 2>/dev/null | awk '$2 ~ /sdb/ {print $1}' | sort -u); do
+  vgchange -an "$vg" || true
+  # optional hard clean if this VG is only for these data disks:
+  # lvremove -fy "$vg" || true
+  # vgremove -fy "$vg" || true
+done
+# Remove the PV label from sdb (even if it complains, that’s ok)
+pvremove -ff -y "$disk" 2>/dev/null || true
+
+# 3) If md-raid or dm-crypt are holding it, drop them
+mdadm --stop --scan 2>/dev/null || true
+mdadm --zero-superblock -f "$disk" 2>/dev/null || true
+cryptsetup luksClose "$(ls /dev/mapper 2>/dev/null | grep -E '^luks-')" 2>/dev/null || true
+
+# 4) Remove any device-mapper holders on sdb
+for dm in $(lsblk -rno NAME,PKNAME 2>/dev/null | awk '$2=="sdb"{print $1}'); do
+  dmsetup remove -f "/dev/mapper/$dm" 2>/dev/null || true
+done
+
+# 5) Now nuke signatures & partition table
+wipefs -fa "$disk" || true
+sgdisk --zap-all "$disk" || true
+# Fallback zeroing of first blocks if needed
+dd if=/dev/zero of="$disk" bs=1M count=32 status=none || true
+
+# 6) Make the kernel forget old tables and settle
+partprobe "$disk" || true
+udevadm settle
