@@ -1,0 +1,23 @@
+# Detect if disk has any partitions (rc==0 means partitions exist)
+- name: detect if device has partitions
+  ansible.builtin.shell: |
+    set -euo pipefail
+    # prints "part" lines if partitions exist; grep -q returns rc=0 when found
+    lsblk -nrpo TYPE {{ item }} | grep -q '^part$' || lsblk -nrpo TYPE {{ item }} | grep -q ' part$'
+  loop: "{{ pvs_to_create }}"
+  register: partchk
+  changed_when: false
+  failed_when: false
+
+- name: zap partition table when partitions exist
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if command -v sgdisk >/dev/null 2>&1; then
+      sgdisk --zap-all {{ item }}
+    else
+      parted -s {{ item }} mklabel gpt || true
+    fi
+    partprobe {{ item }} 2>/dev/null || true
+    udevadm settle
+  loop: "{{ pvs_to_create }}"
+  when: partchk.results[ansible_loop.index0].rc == 0
