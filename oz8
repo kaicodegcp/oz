@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# datavg_cleanup.sh — one-time cleanup for VG "datavg"
+# - Unmounts all datavg LVs
+# - Removes matching /etc/fstab entries
+# - Removes LVs -> VG -> PV signatures
+# - Optionally zaps parent disks' partition tables (if --zap-disks)
+# Usage:
+#   ./datavg_cleanup.sh            # report only (dry run)
+#   ./datavg_cleanup.sh --wipe     # DO THE CLEANUP
+#   ./datavg_cleanup.sh --wipe --zap-disks   # also zap GPT/MBR on parent disks
+set -euo pipefail
+
+VG_NAME="datavg"
+DO_WIPE=0
+ZAP_DISKS=0
+
+for arg in "${@:-}"; do
+  case "$arg" in
+    --wipe) DO_WIPE=1;;
+    --zap-disks) ZAP_DISKS=1;;
+    -h|--help)
+      grep '^# ' "$0" | sed 's/^# //'; exit 0;;
+    *) echo "Unknown arg: $arg"; exit 1;;
+  esac
+done
+
+need_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Run as root." >&2
+    exit 1
+  fi
+}
+need_cmds() {
+  local miss=0
+  for c in vgs lvs pvs findmnt awk sed grep xargs wipefs; do
+    command -v "$c" >/dev/null 2>&1 || { echo "Missing: $c"; miss=1; }
+  done
+  [[ $miss -eq 0 ]] || exit 1
+  # Optional tools we try to use if present: sgdisk, blkdiscard, partprobe, blockdev
+}
+
+confirm_wipe() {
+  echo "=== SUMMARY (dry-run=$((1-DO_WIPE))) ==="
+  echo "VG: $VG_NAME"
+  echo "ZAP DISKS: $ZAP_DISKS"
+  if [[ $DO_WIPE -eq 1 ]]; then
+    read -r -p "Proceed with destructive cleanup of '$VG_NAME'? Type YES: " ans
+    [[ "$ans" == "YES" ]] || { echo "Aborted."; exit 1; }
+  fi
+}
+
+report() {
+  echo ">> Checking for VG '$VG_NAME'..."
+  if ! vgs --noheadings -o vg_name 2>/dev/null | awk '{$1=$1}1' | grep -qx "$VG_NAME"; then
+    echo "No VG named '$VG_NAME' found. Nothing to do."
+    exit 0
+  fi
+
+  echo ">> Logical Volumes:"
+  lvs -o lv_name,lv_path,devices,lv_size,lv_attr "$VG_NAME" || true
+
+  echo ">> Mountpoints using datavg:"
+  # List LV paths then map to mountpoints
+  while read -r lvpath; do
+    mp=$(findmnt -rn -S "$lvpath" -o TARGET || true)
+    [[ -n "$mp" ]] && echo "$lvpath -> $mp"
+  done < <(lvs --noheadings -o lv_path "$VG_NAME" | awk '{$1=$1}1')
+
+  echo ">> /etc/fstab entries referencing datavg:"
+  grep -n "datavg-" /etc/fstab || echo "(none)"
+
+  echo ">> PVs in datavg:"
+  pvs --noheadings -o pv_name,vg_name | awk '$2=="'"$VG_NAME"'" {print $1}'
+}
+
+remove_fstab_entries() {
+  echo ">> Backing up /etc/fstab to /etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a /etc/fstab "/etc/fstab.bak.$(date +%Y%m%d%H%M%S)"
+  tmp=$(mktemp)
+  sed '/datavg-/d' /etc/fstab > "$tmp"
+  mv "$tmp" /etc/fstab
+}
+
+parent_disk_of() {
+  # Given /dev/sdX1 -> /dev/sdX , /dev/nvme0n1p1 -> /dev/nvme0n1
+  local part="$1"
+  lsblk -no PKNAME "$part" 2>/dev/null | awk '{print "/dev/"$1}'
+}
+
+zap_parent_disks() {
+  declare -A seen
+  while read -r pv; do
+    disk=$(parent_disk_of "$pv" || true)
+    [[ -n "$disk" ]] || continue
+    [[ -n "${seen[$disk]:-}" ]] && continue
+    seen[$disk]=1
+    echo "   - Zapping partition table on $disk"
+    if command -v sgdisk >/dev/null 2>&1; then
+      sgdisk -Z "$disk" || true
+    else
+      # Fallback: wipe first/last 10MB which clears most labels (less thorough than sgdisk)
+      dd if=/dev/zero of="$disk" bs=1M count=10 conv=fsync || true
+      # Try last 10MB:
+      sz=$(blockdev --getsz "$disk" 2>/dev/null || echo 0)
+      if [[ "$sz" -gt 0 ]]; then
+        dd if=/dev/zero of="$disk" bs=512 seek="$((sz-20480))" count=20480 conv=fsync || true
+      fi
+    fi
+    command -v partprobe >/dev/null 2>&1 && partprobe "$disk" || true
+  done < <(pvs --noheadings -o pv_name,vg_name | awk '$2=="'"$VG_NAME"'" {print $1}')
+}
+
+do_cleanup() {
+  echo ">> Unmounting any datavg mountpoints..."
+  while read -r lvpath; do
+    mp=$(findmnt -rn -S "$lvpath" -o TARGET || true)
+    if [[ -n "$mp" ]]; then
+      echo "   - umount $mp"
+      umount "$mp" || umount -l "$mp" || true
+    fi
+  done < <(lvs --noheadings -o lv_path "$VG_NAME" | awk '{$1=$1}1')
+
+  echo ">> Removing /etc/fstab entries for datavg-*"
+  remove_fstab_entries
+
+  echo ">> Removing Logical Volumes in $VG_NAME..."
+  # Try swapoff for any swap LV first
+  while read -r lvpath; do
+    if grep -qw "$lvpath" /proc/swaps; then
+      echo "   - swapoff $lvpath"
+      swapoff "$lvpath" || true
+    fi
+  done < <(lvs --noheadings -o lv_path "$VG_NAME" | awk '{$1=$1}1')
+
+  lvremove -fy "$VG_NAME" || true
+
+  echo ">> Deactivating and removing VG $VG_NAME..."
+  vgchange -an "$VG_NAME" || true
+  vgremove -fy "$VG_NAME" || true
+
+  echo ">> Wiping PV signatures..."
+  while read -r pv; do
+    echo "   - pvremove -ffy $pv"
+    pvremove -ffy "$pv" || true
+    echo "   - wipefs -af $pv"
+    wipefs -af "$pv" || true
+    if command -v blkdiscard >/dev/null 2>&1; then
+      blkdiscard -f "$pv" || true
+    else
+      dd if=/dev/zero of="$pv" bs=1M count=10 conv=fsync || true
+    fi
+    command -v blockdev >/dev/null 2>&1 && blockdev --rereadpt "$pv" || true
+  done < <(pvs --noheadings -o pv_name,vg_name | awk '$2=="'"$VG_NAME"'" {print $1}')
+
+  if [[ $ZAP_DISKS -eq 1 ]]; then
+    echo ">> Zapping parent disks of PVs (partition tables) ..."
+    zap_parent_disks
+  fi
+
+  echo ">> Cleanup complete."
+}
+
+# -------- main --------
+need_root
+need_cmds
+report
+confirm_wipe
+
+if [[ $DO_WIPE -eq 0 ]]; then
+  echo
+  echo "Dry run only. Re-run with --wipe to perform the cleanup."
+  exit 0
+fi
+
+do_cleanup
