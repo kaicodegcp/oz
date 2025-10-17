@@ -1,0 +1,48 @@
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+
+file_path = "/appl/hjx_data_p/MRS_AUGMENTED/temp/mrs_augmented_drpsesr_2_0.parquet"
+
+# ---- Schema (as you had) ----
+try:
+    arrow_schema = pq.read_schema(file_path)
+except Exception:
+    pf = pq.ParquetFile(file_path)
+    arrow_schema = getattr(pf, "schema_arrow", None) or pf.schema.to_arrow_schema()
+
+rows = []
+for f in arrow_schema:
+    rows.append({
+        "Column Name": f.name,
+        "Data Type": str(f.type),
+        "Nullable": f.nullable,
+    })
+
+df_schema = pd.DataFrame(rows, columns=["Column Name", "Data Type", "Nullable"])
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", None)
+print("\n=== Column Names, Data Types, Nullable ===")
+print(df_schema.to_string(index=False))
+
+# ---- First 10 rows ----
+print("\n=== First 10 rows ===")
+first10_df = None
+
+try:
+    # Preferred: stream only what we need
+    dataset = ds.dataset(file_path, format="parquet")
+    scanner = ds.Scanner.from_dataset(dataset, batch_size=10)  # stream 10 rows
+    reader = scanner.to_reader()
+    batch = reader.read_next_batch()  # one RecordBatch of up to 10 rows
+    first10_df = batch.to_pandas()
+except Exception as e1:
+    try:
+        # Fallback: read then slice (may load more data depending on file/arrow version)
+        tbl = pq.read_table(file_path, use_threads=True)
+        first10_df = tbl.slice(0, 10).to_pandas()
+    except Exception as e2:
+        raise RuntimeError(f"Could not read first 10 rows via dataset or fallback: {e1} / {e2}")
+
+print(first10_df.to_string(index=False))
