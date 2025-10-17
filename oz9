@@ -46,3 +46,50 @@ except Exception as e1:
         raise RuntimeError(f"Could not read first 10 rows via dataset or fallback: {e1} / {e2}")
 
 print(first10_df.to_string(index=False))
+
+
+
+
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import pyarrow.compute as pc
+
+file_path = "/appl/hjx_data_p/MRS_AUGMENTED/temp/mrs_augmented_drpsesr_2_0.parquet"
+
+def first_n_where_gse_pls(path, n=10):
+    # Try efficient dataset scan with filter (streams only needed rows)
+    try:
+        dataset = ds.dataset(path, format="parquet")
+        filt = (ds.field("gse") == "PLS")
+        scanner = ds.Scanner.from_dataset(dataset, filter=filt, batch_size=2048)
+        reader = scanner.to_reader()
+
+        batches, total = [], 0
+        while total < n:
+            try:
+                b = reader.read_next_batch()
+            except StopIteration:
+                break
+            if b is None or b.num_rows == 0:
+                continue
+            batches.append(b)
+            total += b.num_rows
+
+        if batches:
+            tbl = pa.Table.from_batches(batches).slice(0, n)
+            return tbl.to_pandas()
+
+    except Exception:
+        pass  # fall back below
+
+    # Fallback: read table then filter (may read more, but always works)
+    tbl = pq.read_table(path, use_threads=True)
+    mask = pc.equal(tbl["gse"], pa.scalar("PLS"))
+    tbl_pls = tbl.filter(mask).slice(0, n)
+    return tbl_pls.to_pandas()
+
+df_10 = first_n_where_gse_pls(file_path, n=10)
+print(df_10.to_string(index=False))
+
