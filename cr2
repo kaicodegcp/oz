@@ -1,0 +1,46 @@
+# Split the fullchain into cert1.pem, cert2.pem, ... in /tmp/certs
+mkdir -p /tmp/certs
+awk 'BEGIN{c=0} /-----BEGIN CERT/{c++} {print > ("/tmp/certs/cert" c ".pem")}' /root/citi-certs/wildcard-fullchain.pem
+
+# Compare modulus of each cert with the key
+for f in /tmp/certs/cert*.pem; do
+  echo "Testing $f"
+  C=$(openssl x509 -in "$f" -noout -modulus | openssl md5)
+  K=$(openssl rsa  -in /root/citi-certs/wildcard-unenc.key -noout -modulus | openssl md5)
+  echo "  cert: $C"
+  echo "  key : $K"
+done
+
+export BASE_NS="dex-base-k4sg67rt"
+export VC_NS="dex-app-4n9wpd5l"
+export VC_SC_NS="dex-app-sc-4n9wpd5l"
+
+# Pick the matching leaf file (e.g., /tmp/certs/cert1.pem) and your key path
+LEAF=/tmp/certs/cert1.pem
+KEY=/root/citi-certs/wildcard-unenc.key
+
+# Create/replace secrets
+oc create secret tls tls-dex-base --cert="$LEAF" --key="$KEY" -n "$BASE_NS" --dry-run=client -o yaml | oc apply -f -
+oc create secret tls tls-dex-app  --cert="$LEAF" --key="$KEY" -n "$VC_NS"   --dry-run=client -o yaml | oc apply -f -
+oc create secret tls tls-dex-app-sc --cert="$LEAF" --key="$KEY" -n "$VC_SC_NS" --dry-run=client -o yaml | oc apply -f -
+
+# Patch ingresses to use the secrets (names usually dex-*-ingress; if different, list them)
+for ns in "$BASE_NS" "$VC_NS" "$VC_SC_NS"; do
+  echo "Ingresses in $ns:"
+  oc -n "$ns" get ing
+done
+
+# Example patches (adjust ingress names if they differ)
+oc -n "$BASE_NS"   patch ing dex-base-ingress   --type='json' -p='[{"op":"add","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-base"}]}]'
+oc -n "$VC_NS"     patch ing dex-app-ingress    --type='json' -p='[{"op":"add","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-app"}]}]'
+oc -n "$VC_SC_NS"  patch ing dex-app-sc-ingress --type='json' -p='[{"op":"add","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-app-sc"}]}]'
+
+# Roll pods that rely on the secrets (optional; usually auto)
+oc -n "$BASE_NS" rollout restart deploy
+oc -n "$VC_NS"   rollout restart deploy
+oc -n "$VC_SC_NS" rollout restart deploy
+
+
+oc -n "$VC_NS" get ing -o yaml | grep -A3 tls:
+./cde-utils-oc.sh init-virtual-cluster -h "$VC_HOST" -a
+        
