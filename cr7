@@ -1,0 +1,47 @@
+openssl pkcs7 -in leaf.p7b -inform DER -print_certs -out full-from-p7b.pem
+
+openssl pkcs12 -in bundle.pfx -nodes -clcerts -nokeys -out wildcard-signed.crt
+# if needed, also extract key and check it matches your wildcard-unenc.key
+
+cat wildcard-signed.crt Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > wildcard-fullchain.pem
+
+# 1) Leaf is a CERT (not CSR)
+head -1 wildcard-signed.crt                 # => -----BEGIN CERTIFICATE-----
+
+# 2) SANs exist on the leaf
+openssl x509 -in wildcard-signed.crt -noout -ext subjectAltName
+
+# 3) Key ↔ leaf match (MD5 must be IDENTICAL)
+openssl x509 -in wildcard-signed.crt  -noout -modulus | openssl md5
+openssl rsa  -in wildcard-unenc.key   -noout -modulus | openssl md5
+
+# 4) Chain order sanity (leaf -> intermediate -> root)
+openssl crl2pkcs7 -nocrl -certfile wildcard-fullchain.pem \
+| openssl pkcs7 -print_certs -noout | egrep 'Subject:|Issuer:'
+
+export KUBECONFIG=/root/kubeconfig-current.yaml
+export BASE_NS="dex-base-k4sg67rt"
+export APP_NS="dex-app-4n9wpd5l"
+
+oc -n "$BASE_NS" create secret tls tls-dex-base \
+  --cert=/root/citi-certs/wildcard-fullchain.pem \
+  --key=/root/citi-certs/wildcard-unenc.key \
+  --dry-run=client -o yaml | oc apply -f -
+
+oc -n "$APP_NS" create secret tls tls-dex-app-4n9wpd5l \
+  --cert=/root/citi-certs/wildcard-fullchain.pem \
+  --key=/root/citi-certs/wildcard-unenc.key \
+  --dry-run=client -o yaml | oc apply -f -
+
+oc -n "$BASE_NS" patch ing dex-base-api --type=json \
+  -p='[{"op":"add","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-base"}]}]' \
+|| oc -n "$BASE_NS" patch ing dex-base-api --type=json \
+  -p='[{"op":"replace","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-base"}]}]'
+
+oc -n "$APP_NS" patch ing dex-app-4n9wpd5l-api --type=json \
+  -p='[{"op":"add","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-app-4n9wpd5l"}]}]' \
+|| oc -n "$APP_NS" patch ing dex-app-4n9wpd5l-api --type=json \
+  -p='[{"op":"replace","path":"/spec/tls","value":[{"hosts":[],"secretName":"tls-dex-app-4n9wpd5l"}]}]'
+
+oc -n "$BASE_NS" rollout restart deploy
+oc -n "$APP_NS"  rollout restart deploy
