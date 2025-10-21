@@ -1,0 +1,16 @@
+1) Quick health check (API reachable over TLS)
+export VC_HOST="4n9wpd5l.cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+
+# self-signed => use -k
+curl -k -sS "https://${VC_HOST}/dex/api/v1/version"
+
+
+You should see a small JSON with a version string.
+
+If you get connection errors, run:
+
+oc -n dex-app-4n9wpd5l get ing dex-app-4n9wpd5l-api -o yaml | sed -n '/tls:/,/rules:/p'
+
+
+and confirm secretName: tls-dex-app-4n9wpd5l is present.
+
