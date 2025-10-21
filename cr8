@@ -1,0 +1,116 @@
+
+VC_HOST="4n9wpd5l.cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+
+# Show the exact certificate that the VC is presenting
+echo | openssl s_client -connect ${VC_HOST}:443 -servername ${VC_HOST} 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates -ext subjectAltName
+
+
+============
+# === customize if yours differ ===
+export VC_ID="4n9wpd5l"
+export CDE_CLUSTER_ID="cde-k4sg67rt"
+export APPS_BASE="mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+
+# derived
+export CDE_HOST="${VC_ID}.${CDE_CLUSTER_ID}.apps.${APPS_BASE}"
+export CDE_API="https://${CDE_HOST}/dex/api/v1"
+
+# paths to your certs/keys
+export CDE_CERT="/path/to/wildcard-fullchain.crt"   # cert + full chain
+export CDE_KEY="/path/to/wildcard.key"              # unencrypted key
+
+# Your CDE VC namespace in OCP (from your screenshot)
+export VC_NS="dex-app-${VC_ID}"
+
+
+getent hosts ${CDE_HOST}
+curl -vk https://${CDE_HOST}/ -o /dev/null
+
+curl -fsSL -o cde-utils.sh \
+  https://archive.cloudera.com/p/cdp-pvc-ds/1.5.4/cde/cde-utils.sh
+chmod +x cde-utils.sh
+
+# This operation targets the VC host and injects TLS cert/key to the routes
+./cde-utils.sh init-virtual-cluster \
+  -h "${CDE_HOST}" \
+  -c "${CDE_CERT}" \
+  -k "${CDE_KEY}"
+
+oc get route -n "${VC_NS}"
+oc get route -n "${VC_NS}" -o yaml | awk '/^  tls:/{p=1} p'
+
+
+oc get pods -n "${VC_NS}"
+# if anything Pending/CrashLoop, check:
+# oc describe pod/<name> -n "${VC_NS}"
+# oc logs <pod> -n "${VC_NS}"
+
+
+
+# Example only—replace principal with your actual one
+ktutil <<'EOF'
+add_entry -password -p YOUR.PRINCIPAL@YOUR.REALM -k 1 -e rc4-hmac
+# you'll be prompted for the password
+wkt ~/cde-user.keytab
+quit
+EOF
+
+kinit -kt ~/cde-user.keytab YOUR.PRINCIPAL@YOUR.REALM
+klist   # verify a valid TGT
+
+
+
+# Fetch CLI (use a version compatible with your service; 1.22.x is fine for DS 1.5.x)
+curl -fsSL -o cde-cli.tgz https://archive.cloudera.com/p/cde/cli/latest/linux/cde.tgz
+mkdir -p ~/bin/cde && tar -xzf cde-cli.tgz -C ~/bin/cde --strip-components=1
+export PATH="$HOME/bin/cde:$PATH"
+
+# Configure endpoint
+cde config set endpoint "${CDE_API}"
+
+# Authenticate (choose ONE flow that matches your setup)
+# Kerberos:
+cde auth login --kerberos --keytab ~/cde-user.keytab --principal YOUR.PRINCIPAL@YOUR.REALM
+
+# or, if your VC is configured for PAT/OIDC, use:
+# cde auth login
+# (follow browser flow to obtain a token)
+
+
+cde ping
+
+
+cat > pi.py <<'PY'
+from pyspark.sql import SparkSession
+spark = SparkSession.builder.appName("pi-smoke").getOrCreate()
+n = 100000
+count = spark.sparkContext.parallelize(range(1, n+1)).map(lambda i: 1 if i*i % 7 == 0 else 0).sum()
+print("SMOKE_OK", int(count))
+spark.stop()
+PY
+
+
+
+
+cde resource create --name demo-files --type files
+cde resource upload --name demo-files --local-path ./pi.py
+
+cde job create \
+  --name smoke-pi \
+  --type spark \
+  --mount-1 resource:demo-files \
+  --application-file pi.py \
+  --driver-cores 1 --driver-memory 1g \
+  --executor-cores 1 --executor-memory 1g --num-executors 1
+
+# Kick it off
+RUN_ID=$(cde job run --name smoke-pi --verbose | awk '/Run ID:/ {print $3}')
+echo "Started run ${RUN_ID}"
+
+# Tail status
+cde run describe --id "${RUN_ID}"
+cde run logs --id "${RUN_ID}" --follow
+
+
+  
