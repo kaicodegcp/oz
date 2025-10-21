@@ -1,0 +1,74 @@
+[ req ]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+req_extensions     = req_ext
+distinguished_name = dn
+
+[ dn ]
+CN = *.cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net
+O  = Citigroup Inc.
+OU = 170600
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+DNS.1 = *.cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net
+DNS.2 = cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net
+DNS.3 = *.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net
+DNS.4 = apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net
+
+
+openssl req -new -newkey rsa:2048 -nodes \
+  -keyout wildcard.key \
+  -out    wildcard.csr \
+  -config san.cnf
+
+B. Build the full-chain PEM and unencrypted key
+
+Build full chain:
+
+cat wildcard.crt Citi_Device_CA1_G2.crt Citi_Root_CA_G2.crt > wildcard-fullchain.pem
+
+
+Ensure the key is unencrypted (many CAs return passphrase keys—remove it):
+
+# if your key is already unencrypted, this produces the same file
+openssl rsa -in wildcard.key -out wildcard-unenc.key
+
+
+Sanity checks:
+
+# Does the cert contain all four SANs?
+openssl x509 -in wildcard-fullchain.pem -noout -text | grep -A1 "Subject Alternative Name"
+
+# Does the private key match the cert?
+openssl x509 -noout -modulus -in wildcard-fullchain.pem | openssl md5
+openssl rsa  -noout -modulus -in wildcard-unenc.key    | openssl md5
+# The two MD5 digests must be identical
+
+C. Run the Cloudera helper against your VC
+
+Set variables (adjust if your IDs differ):
+
+export VC_HOST="4n9wpd5l.cde-k4sg67rt.apps.mlab-ctigtdcai03d.ecs.dyn.nsroot.net"
+cd /root   # you said cde-utils.sh is here
+
+
+Execute:
+
+./cde-utils.sh init-virtual-cluster \
+  -h "${VC_HOST}" \
+  -c /root/wildcard-fullchain.pem \
+  -k /root/wildcard-unenc.key
+
+
+Verify the route is now serving the new cert:
+
+echo | openssl s_client -connect ${VC_HOST}:443 -servername ${VC_HOST} 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+
+# Or in OCP:
+oc get route -n dex-app-4n9wpd5l
+oc get route -n dex-app-4n9wpd5l -o yaml | awk '/^  tls:/{p=1} p'
