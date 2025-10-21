@@ -1,0 +1,37 @@
+Option A — Get your real signed wildcard cert (recommended for corp CA)
+
+Submit the CSR that was produced with your wildcard.key to your PKI/CA and obtain the signed leaf certificate (often named wildcard.crt).
+
+Build the full chain in the proper order (leaf first, then intermediate(s), root last/optional):
+
+cat wildcard.crt "Citi_Device_CA1_G2.crt" "Citi_Root_CA_G2.crt" > wildcard-fullchain.pem
+
+
+Verify leaf ↔ key match (MD5 digests must be identical):
+
+openssl x509 -in wildcard-fullchain.pem -noout -modulus | openssl md5
+openssl rsa  -in wildcard-unenc.key     -noout -modulus | openssl md5
+
+
+Verify SANs are present on the leaf:
+
+openssl x509 -in wildcard.crt -noout -ext subjectAltName
+
+
+You should see the hostnames you need (e.g. *.cde-k4sg67rt.apps..., cde-k4sg67rt.apps..., etc.).
+
+Then create the secrets and patch ingresses (same as before):
+
+export KUBECONFIG=/root/kubeconfig-current.yaml
+export BASE_NS="dex-base-k4sg67rt"
+export APP_NS="dex-app-4n9wpd5l"
+
+oc -n "$BASE_NS" create secret tls tls-dex-base \
+  --cert=/root/citi-certs/wildcard-fullchain.pem \
+  --key=/root/citi-certs/wildcard-unenc.key \
+  --dry-run=client -o yaml | oc apply -f -
+
+oc -n "$APP_NS" create secret tls tls-dex-app-4n9wpd5l \
+  --cert=/root/citi-certs/wildcard-fullchain.pem \
+  --key=/root/citi-certs/wildcard-unenc.key \
+  --dry-run=client -o yaml | oc apply -f -
