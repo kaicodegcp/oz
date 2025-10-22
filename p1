@@ -1,0 +1,257 @@
+
+
+cti_rhel_eapbigdata_bdeng_vm_maintenance/
+└─ roles/
+   └─ python_custom/
+      ├─ defaults/
+      │  └─ main.yml
+      ├─ files/
+      │  └─ swid_template.j2          # your existing SWIDTAG template
+      └─ tasks/
+         └─ main.yml
+
+         
+roles/python_custom/defaults/main.yml
+
+
+---
+alt_link_python3: /usr/local/bin/python3
+alt_link_python: /usr/local/bin/python
+custom_prefix: "/opt/citi_python"
+py38_home: "{{ custom_prefix }}/python38"
+py27_home: "{{ custom_prefix }}/python27"
+rh38_bin_rhel8: "/opt/rh/rh-python38/root/usr/bin"
+rh27_bin_rhel7: "/opt/rh/rh-python27/root/usr/bin"
+sys_python3_rhel8: "/usr/bin/python3"
+sys_python_rhel7: "/usr/bin/python"
+prio_py38: 40
+prio_sys_py36: 10
+prio_py27: 30
+set_default_python3: true
+set_default_python: true
+default_python3_path: "{{ py38_home }}/bin/python3.8"
+default_python_path: "{{ py27_home }}/bin/python2.7"
+enable_repos_rhel8: ""
+enable_repos_rhel7: ""
+ensure_usr_local_first: true
+py38_label_rhel7: "rhel7-python3.8.18"
+py38_label_rhel8: "rhel8-python3.8.13"
+swidtag_vars_dir: "vars"
+swidtag_vars_prefix: "eap_swidtag_"
+python_version: ""
+linux_path: "/opt/citi_middleware"
+product_name: "ClouderaRedHatPython"
+product_version: "3.8"
+remove_old_swids_glob: "ClouderaRedHatPython-*"
+
+
+roles/python_custom/tasks/main.yml
+---
+- name: Resolve python_version from OS (if not provided)
+  ansible.builtin.set_fact:
+    python_version: >-
+      {{
+        (python_version | default('')) if (python_version | default('') | length > 0)
+        else ((ansible_distribution_major_version | int == 7)
+              | ternary(py38_label_rhel7, py38_label_rhel8))
+      }}
+
+- name: Load matching swidtag vars if present
+  vars:
+    candidate_file: "{{ swidtag_vars_dir }}/{{ swidtag_vars_prefix }}{{ python_version }}.yml"
+  block:
+    - ansible.builtin.stat:
+        path: "{{ candidate_file }}"
+      register: swidtag_vars_stat
+    - ansible.builtin.include_vars:
+        file: "{{ candidate_file }}"
+      when: swidtag_vars_stat.stat.exists
+  rescue:
+    - ansible.builtin.debug:
+        msg: "No SWIDTAG vars at {{ candidate_file }}; proceeding with defaults."
+
+- name: Python version before (whereis)
+  ansible.builtin.shell: 'RS=`whereis python`; echo "$RS"'
+  register: python_version_before
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: python_version_before.stdout
+
+- name: Ensure /etc/profile.d/10-python-alternatives.sh exists
+  ansible.builtin.copy:
+    dest: /etc/profile.d/10-python-alternatives.sh
+    content: |
+      #!/bin/sh
+      case ":$PATH:" in
+        *:/usr/local/bin:*) ;;
+        *) export PATH="/usr/local/bin:$PATH" ;;
+      esac
+    mode: '0644'
+  when: ensure_usr_local_first | bool
+
+- name: Ensure custom prefix and bin dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ custom_prefix }}"
+    - "{{ py38_home }}/bin"
+    - "{{ py27_home }}/bin"
+    - "{{ linux_path }}"
+
+- name: Install Python 3.8 on RHEL8 (rh-python38)
+  ansible.builtin.yum:
+    name: rh-python38
+    state: present
+    enablerepo: "{{ enable_repos_rhel8 }}"
+  when: ansible_distribution_major_version | int == 8
+
+- name: Install Python 3.8 on RHEL7 (SCL rh-python38)
+  ansible.builtin.yum:
+    name: rh-python38
+    state: present
+    enablerepo: "{{ enable_repos_rhel7 }}"
+  when: ansible_distribution_major_version | int == 7
+
+- name: Link python3.8 into our custom prefix
+  ansible.builtin.file:
+    src: "{{ (ansible_distribution_major_version | int == 8) | ternary(rh38_bin_rhel8, '/opt/rh/rh-python38/root/usr/bin') }}/python3.8"
+    dest: "{{ py38_home }}/bin/python3.8"
+    state: link
+
+- name: Link pip3.8 into our custom prefix (if present)
+  ansible.builtin.file:
+    src: "{{ (ansible_distribution_major_version | int == 8) | ternary(rh38_bin_rhel8, '/opt/rh/rh-python38/root/usr/bin') }}/pip3.8"
+    dest: "{{ py38_home }}/bin/pip3.8"
+    state: link
+  ignore_errors: true
+
+- name: Install Python 2.7 on RHEL8 (package python2)
+  ansible.builtin.yum:
+    name: python2
+    state: present
+    enablerepo: "{{ enable_repos_rhel8 }}"
+  when: ansible_distribution_major_version | int == 8
+
+- name: Install Python 2.7 on RHEL7 (SCL rh-python27)
+  ansible.builtin.yum:
+    name: rh-python27
+    state: present
+    enablerepo: "{{ enable_repos_rhel7 }}"
+  when: ansible_distribution_major_version | int == 7
+
+- name: Compute python2.7 vendor bin path
+  ansible.builtin.set_fact:
+    py27_src_bin: "{{ (ansible_distribution_major_version | int == 8) | ternary('/usr/bin', rh27_bin_rhel7) }}"
+
+- name: Link python2.7 into our custom prefix
+  ansible.builtin.file:
+    src: "{{ py27_src_bin }}/python2.7"
+    dest: "{{ py27_home }}/bin/python2.7"
+    state: link
+
+- name: Link pip2 into our custom prefix (if present)
+  ansible.builtin.file:
+    src: "{{ py27_src_bin }}/pip2"
+    dest: "{{ py27_home }}/bin/pip2"
+    state: link
+  ignore_errors: true
+
+- name: Query python3 alternatives
+  ansible.builtin.shell: "update-alternatives --query python3 || true"
+  register: alts_py3
+  changed_when: false
+
+- name: Register system python3 (RHEL8) candidate (low prio) if missing
+  ansible.builtin.shell: |
+    update-alternatives --query python3 2>/dev/null | grep -q "{{ sys_python3_rhel8 }}" \
+    || update-alternatives --install {{ alt_link_python3 }} python3 {{ sys_python3_rhel8 }} {{ prio_sys_py36 }}
+  when: ansible_distribution_major_version | int == 8
+  changed_when: "'{{ sys_python3_rhel8 }}' not in alts_py3.stdout"
+
+- name: Register our python3.8 (preferred) if missing
+  ansible.builtin.shell: |
+    update-alternatives --query python3 2>/dev/null | grep -q "{{ py38_home }}/bin/python3.8" \
+    || update-alternatives --install {{ alt_link_python3 }} python3 {{ py38_home }}/bin/python3.8 {{ prio_py38 }}
+  changed_when: "'{{ py38_home }}/bin/python3.8' not in alts_py3.stdout"
+
+- name: Query python alternatives
+  ansible.builtin.shell: "update-alternatives --query python || true"
+  register: alts_py
+  changed_when: false
+
+- name: Register system 'python' (RHEL7) candidate (low prio) if missing
+  ansible.builtin.shell: |
+    update-alternatives --query python 2>/dev/null | grep -q "{{ sys_python_rhel7 }}" \
+    || update-alternatives --install {{ alt_link_python }} python {{ sys_python_rhel7 }} 10
+  when: ansible_distribution_major_version | int == 7
+  changed_when: "'{{ sys_python_rhel7 }}' not in alts_py.stdout"
+
+- name: Register python2.7 (preferred) if missing
+  ansible.builtin.shell: |
+    update-alternatives --query python 2>/dev/null | grep -q "{{ py27_home }}/bin/python2.7" \
+    || update-alternatives --install {{ alt_link_python }} python {{ py27_home }}/bin/python2.7 {{ prio_py27 }}
+  changed_when: "'{{ py27_home }}/bin/python2.7' not in alts_py.stdout"
+
+- name: Register python3.8 also for 'python' (optional candidate)
+  ansible.builtin.shell: |
+    update-alternatives --query python 2>/dev/null | grep -q "{{ py38_home }}/bin/python3.8" \
+    || update-alternatives --install {{ alt_link_python }} python {{ py38_home }}/bin/python3.8 {{ prio_py38 }}
+  changed_when: "'{{ py38_home }}/bin/python3.8' not in alts_py.stdout"
+
+- name: Set default for 'python3' -> python3.8
+  ansible.builtin.command: "update-alternatives --set python3 {{ default_python3_path }}"
+  when: set_default_python3 | bool
+
+- name: Set default for 'python' -> python2.7
+  ansible.builtin.command: "update-alternatives --set python {{ default_python_path }}"
+  when: set_default_python | bool
+
+- name: Remove older {{ product_name }} swidtags
+  ansible.builtin.shell: "rm -rf {{ remove_old_swids_glob }}"
+  args:
+    chdir: "{{ linux_path }}"
+  register: older_swidtag_removal
+  failed_when: false
+  changed_when: false
+
+- name: Copy SWID template to remote machine
+  ansible.builtin.template:
+    src: "swid_template.j2"
+    dest: "{{ linux_path }}/{{ product_name }}-{{ product_version }}.swidtag"
+    mode: '0644'
+
+- name: Get the SWIDTAG file content
+  ansible.builtin.command: "cat {{ linux_path }}/{{ product_name }}-{{ product_version }}.swidtag"
+  register: swidtag_cat
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: swidtag_cat.stdout
+
+- name: Python version after (whereis)
+  ansible.builtin.shell: 'RS=`whereis python`; echo "$RS"'
+  register: python_version_after
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: python_version_after.stdout
+
+- name: Show python3 alternatives
+  ansible.builtin.command: "update-alternatives --display python3"
+  register: disp_py3
+  changed_when: false
+
+- name: Show python alternatives
+  ansible.builtin.command: "update-alternatives --display python"
+  register: disp_py
+  changed_when: false
+
+- ansible.builtin.debug:
+    msg:
+      - "python3 alternatives:\n{{ disp_py3.stdout }}"
+      - "python alternatives:\n{{ disp_py.stdout }}"
+
+
