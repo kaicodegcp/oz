@@ -1,0 +1,172 @@
+---
+- name: Resolve python_version from OS (if not provided)
+  ansible.builtin.set_fact:
+    python_version: >-
+      {{
+        (python_version | default('')) if (python_version | default('') | length > 0)
+        else (ansible_distribution_major_version | int == 7)
+        | ternary(py38_label_rhel7, py38_label_rhel8)
+      }}
+
+- name: Load matching swidtag vars if present
+  vars:
+    candidate_file: "{{ swidtag_vars_dir }}/{{ swidtag_vars_prefix }}{{ python_version }}.yml"
+  block:
+    - ansible.builtin.stat:
+        path: "{{ candidate_file }}"
+      register: swidtag_vars_stat
+    - ansible.builtin.include_vars:
+        file: "{{ candidate_file }}"
+      when: swidtag_vars_stat.stat.exists
+  rescue:
+    - ansible.builtin.debug:
+        msg: "No SWIDTAG vars at {{ candidate_file }}; proceeding with defaults."
+
+- name: Python version before (whereis)
+  ansible.builtin.shell: 'RS=`whereis python`; echo "$RS"'
+  register: python_version_before
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: python_version_before.stdout
+
+- name: Ensure /etc/profile.d/10-python-alternatives.sh exists
+  ansible.builtin.copy:
+    dest: /etc/profile.d/10-python-alternatives.sh
+    content: |
+      #!/bin/sh
+      case ":$PATH:" in
+        *:/usr/local/bin:*) ;;
+        *) export PATH="/usr/local/bin:$PATH" ;;
+      esac
+    mode: '0644'
+  when: ensure_usr_local_first | bool
+
+- name: Ensure custom prefix and bin dirs exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ custom_prefix }}"
+    - "{{ py38_home }}/bin"
+    - "{{ py27_home }}/bin"
+    - "{{ linux_path }}"
+
+- name: Install Python 3.8 on RHEL8
+  ansible.builtin.yum:
+    name: python38
+    disablerepo: '*'
+    enablerepo: "{{ enable_repos_rhel8 }}"
+    update_cache: yes
+    state: present
+  when: ansible_distribution_major_version | int == 8
+
+- name: Install Python 3.8 on RHEL7
+  ansible.builtin.yum:
+    name: python38
+    disablerepo: '*'
+    enablerepo: "{{ enable_repos_rhel7 }}"
+    update_cache: yes
+    state: present
+  when: ansible_distribution_major_version | int == 7
+
+- name: Link python3.8 into our custom prefix
+  ansible.builtin.file:
+    src: /usr/bin/python3.8
+    dest: "{{ py38_home }}/bin/python3.8"
+    state: link
+
+- name: Install Python 2.7 on RHEL8
+  ansible.builtin.yum:
+    name: python2
+    disablerepo: '*'
+    enablerepo: "{{ enable_repos_rhel8 }}"
+    update_cache: yes
+    state: present
+  when: ansible_distribution_major_version | int == 8
+
+- name: Install Python 2.7 on RHEL7
+  ansible.builtin.yum:
+    name: python2
+    disablerepo: '*'
+    enablerepo: "{{ enable_repos_rhel7 }}"
+    update_cache: yes
+    state: present
+  when: ansible_distribution_major_version | int == 7
+
+- name: Link python2.7 into our custom prefix
+  ansible.builtin.file:
+    src: /usr/bin/python2.7
+    dest: "{{ py27_home }}/bin/python2.7"
+    state: link
+
+- name: Register python3-custom (non-system) alternative
+  ansible.builtin.shell: |
+    update-alternatives --query python3-custom >/dev/null 2>&1 \
+    || update-alternatives --install /usr/local/bin/python3 python3-custom {{ py38_home }}/bin/python3.8 20
+  register: py38_alt_reg
+  changed_when: "'install' in py38_alt_reg.cmd or py38_alt_reg.rc == 0"
+  failed_when: false
+  when: ansible_distribution_major_version | int == 8
+
+- name: Register python2-custom (legacy alt)
+  ansible.builtin.shell: |
+    update-alternatives --query python-custom >/dev/null 2>&1 \
+    || update-alternatives --install /usr/local/bin/python python-custom {{ py27_home }}/bin/python2.7 10
+  register: py27_alt_reg
+  changed_when: "'install' in py27_alt_reg.cmd or py27_alt_reg.rc == 0"
+  failed_when: false
+
+- name: Set default for 'python3-custom' -> python3.8
+  ansible.builtin.command: update-alternatives --set python3-custom {{ py38_home }}/bin/python3.8
+  when: set_default_python3 | bool
+
+- name: Set default for 'python-custom' -> python2.7
+  ansible.builtin.command: update-alternatives --set python-custom {{ py27_home }}/bin/python2.7
+  when: set_default_python | bool
+
+- name: Remove older {{ product_name }} swidtags
+  ansible.builtin.shell: "rm -rf {{ remove_old_swids_glob }}"
+  args:
+    chdir: "{{ linux_path }}"
+  register: older_swidtag_removal
+  failed_when: false
+  changed_when: false
+
+- name: Copy SWID template to remote machine
+  ansible.builtin.template:
+    src: files/swid_template.j2
+    dest: "{{ linux_path }}/{{ product_name }}-{{ product_version }}.swidtag"
+    mode: '0644'
+
+- name: Get the SWIDTAG file content
+  ansible.builtin.shell: "cat {{ linux_path }}/{{ product_name }}-{{ product_version }}.swidtag"
+  register: swidtag_cat
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: swidtag_cat.stdout
+
+- name: Python version after (whereis)
+  ansible.builtin.shell: 'RS=`whereis python`; echo "$RS"'
+  register: python_version_after
+  changed_when: false
+
+- ansible.builtin.debug:
+    var: python_version_after.stdout
+
+- name: Show python3-custom alternatives
+  ansible.builtin.command: update-alternatives --display python3-custom
+  register: disp_py3
+  changed_when: false
+
+- name: Show python-custom alternatives
+  ansible.builtin.command: update-alternatives --display python-custom
+  register: disp_py
+  changed_when: false
+
+- ansible.builtin.debug:
+    msg:
+      - "python3-custom alternatives:\n{{ disp_py3.stdout }}"
+      - "python-custom alternatives:\n{{ disp_py.stdout }}"
