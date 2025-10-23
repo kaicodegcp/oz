@@ -1,0 +1,41 @@
+Multi-Version Python Deployment for EAP Services with OS-Safe Softlink Isolation
+Submitted for Week Ending
+
+10/3/2025
+
+Description
+
+Supporting Cloudera EAP Operations with Flexible and Non-Intrusive Python Installation:
+The EAP Strategic Solutions team designed and implemented a custom Ansible-based Python deployment solution that installs multiple required Python versions (2.7, 3.8, and 3.9 via Citiconda) on RHEL7 and RHEL8 systems—without altering the OS-default Python binaries or symlinks.
+
+This enhancement addresses a long-standing challenge where OS patching or Ansible convergence processes forcibly reset /usr/bin/python and /usr/bin/python3 to the system defaults (e.g., Python 3.6), breaking EAP services that depend on specific Python versions for compatibility. The new playbook avoids this risk by leveraging the update-alternatives mechanism and fully isolates custom versions from OS-provided paths.
+
+Key Achievements:
+
+Deployed custom installation of Python 2.7, 3.8, and Citiconda-based Python 3.9 without modifying /usr/bin/python*.
+
+Designed a reusable Ansible playbook that auto-detects RHEL version and installs required Python RPMs or parcels.
+
+Used update-alternatives --install to register EAP-specific Python versions and safely override softlinks used by EAP workloads.
+
+Confirmed compatibility with Cloudera services and ensured no interference with OS-level Python dependencies.
+
+Rolled out changes successfully to PROD systems to support VTM and Cloudera integrations.
+
+Benefits to the Team:
+
+Prevents service disruption due to OS patching that resets Python symlinks.
+
+Allows safe coexistence of multiple Python versions per server.
+
+Ensures that Ansible, Citiconda, and Cloudera workloads operate with the correct Python interpreter.
+
+Reduces manual troubleshooting and increases automation reliability across environments.
+
+Next Steps:
+
+Extend automation to include optional pip package sets per version (e.g., boto3, requests).
+
+Integrate softlink validation in Python health-check playbooks.
+
+Publish the solution to EAP Automation repo for cross-team adoption and onboarding.
